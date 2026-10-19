@@ -4,9 +4,8 @@ import argparse
 import logging
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from .ai import LLMAnalyst, LLMClient, RuleAnalyst
 from .analysis import KISMarketData, screen
@@ -15,15 +14,10 @@ from .brokers import KISBroker, SimBroker
 from .config import Settings, load_settings
 from .engine import Plan, TradingEngine
 from .journal import Journal
+from .kis import KISError
+from .market_calendar import KST, TRADE_END, MarketCalendar
 
-KST = ZoneInfo("Asia/Seoul")
 log = logging.getLogger("kis_ai_trader")
-
-
-def is_market_open(now: datetime | None = None) -> bool:
-    now = now or datetime.now(KST)
-    # 장 시작 직후 변동성과 종가 동시호가 구간은 피한다.
-    return now.weekday() < 5 and dtime(9, 5) <= now.time() <= dtime(15, 15)
 
 
 def make_analyst(settings: Settings, use_llm: bool = True):
@@ -97,25 +91,60 @@ def cmd_scan(settings: Settings, args) -> None:
               f"20일 {f['ret_20d']:+6.1%}  RSI {f['rsi14']:5.1f}  거래량비 {f['volume_ratio']:.1f}")
 
 
+def is_auth_error(exc: KISError) -> bool:
+    return exc.msg_cd in {"EGW00103", "EGW00105"} or any(k in exc.msg.lower() for k in ("appkey", "appsecret"))
+
+
+def seconds_until_next_check(cal: MarketCalendar, now: datetime, is_open: bool, interval_min: int) -> float:
+    if is_open:
+        return interval_min * 60
+    nxt = cal.next_open(now)
+    if nxt <= now:
+        # 달력상 장중인데 체결 데이터가 없을 때(개장 지연 등): 잠시 후 재확인
+        return 5 * 60
+    # 장기간 휴장이어도 30분마다 깨어나 상태를 출력한다(PC 절전 복귀 등 대비).
+    return min((nxt - now).total_seconds(), 30 * 60)
+
+
 def cmd_run(settings: Settings, args) -> None:
     guard_real(settings, args.live)
     engine, md = build_engine(settings, not args.no_llm)
+    cal = MarketCalendar(md.api, settings.trading.extra_holidays)
     print(f"브로커: {engine.broker.name} | 분석가: {type(engine.analyst).__name__} | dry-run: {args.dry_run}")
+    print("종료하려면 Ctrl+C 를 누르세요.")
+    reported: set = set()
+    last_status = ""
     while True:
-        if args.force or is_market_open():
+        now = datetime.now(KST)
+        is_open, why = (True, "강제 실행") if args.force else cal.status(now)
+        if is_open:
             md.reset_intraday()
             try:
-                plan, _ = engine.run_cycle(dry_run=args.dry_run)
+                plan, _ = engine.run_cycle(now=now.replace(tzinfo=None), dry_run=args.dry_run)
                 print_plan(plan)
-            except Exception:
-                log.exception("매매 사이클 실패")
+            except KISError as exc:
+                if is_auth_error(exc):
+                    sys.exit(f"한국투자증권 키 오류: {exc}\n.env 의 KIS_APP_KEY/KIS_APP_SECRET 을 확인하거나 "
+                             "'python start.py --setup' 으로 다시 입력하세요. (모의/실전 키와 KIS_ENV 가 일치해야 합니다)")
+                log.error("매매 사이클 실패 (다음 주기에 재시도): %s", exc)
+                if args.once:
+                    raise
+            except Exception as exc:
+                log.error("매매 사이클 실패 (다음 주기에 재시도): %s", exc, exc_info=args.verbose)
                 if args.once:
                     raise
         else:
-            print(f"{datetime.now(KST):%H:%M} 장 운영시간 아님 (평일 09:05~15:15). --force 로 강제 실행 가능")
+            if why != last_status:
+                nxt = cal.next_open(now)
+                print(f"{now:%m-%d %H:%M} 매매 대기: {why}. 다음 장 시작 {nxt:%m-%d(%a) %H:%M}")
+            if now.time() > TRADE_END and now.date() not in reported and not cal.holiday_reason(now.date()):
+                reported.add(now.date())
+                print("\n[오늘 장 마감 리포트]")
+                cmd_report(settings, argparse.Namespace(recent=5))
+        last_status = "" if is_open else why
         if args.once:
             return
-        time.sleep(settings.trading.loop_interval_min * 60)
+        time.sleep(seconds_until_next_check(cal, now, is_open, settings.trading.loop_interval_min))
 
 
 def cmd_backtest(settings: Settings, args) -> None:

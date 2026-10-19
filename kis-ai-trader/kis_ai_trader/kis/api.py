@@ -88,6 +88,21 @@ class KISApi:
         df = df.drop_duplicates("date").sort_values("date").set_index("date")
         return df[df["close"] > 0].tail(days)
 
+    def is_trading_day(self, ymd: str) -> bool | None:
+        """국내휴장일조회. 모의투자 서버는 미지원이라 None. KIS 권장대로 하루 1회만 호출할 것."""
+        if self.cfg.is_paper:
+            return None
+        data, _ = self.client.request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/chk-holiday",
+            "CTCA0903R",
+            params={"BASS_DT": ymd, "CTX_AREA_NK": "", "CTX_AREA_FK": ""},
+        )
+        for row in data.get("output", []):
+            if row.get("bass_dt") == ymd:
+                return row.get("opnd_yn") == "Y"
+        return None
+
     def get_volume_rank(self, limit: int = 30) -> list[tuple[str, str]]:
         """거래량 순위. 모의투자 서버는 지원하지 않는다."""
         data, _ = self.client.request(

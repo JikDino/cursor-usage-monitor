@@ -87,6 +87,7 @@ class TradingConfig:
     fee_rate: float = 0.00015
     sell_tax_rate: float = 0.002
     slippage_pct: float = 0.001
+    extra_holidays: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -140,5 +141,6 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         fee_rate=_float("FEE_RATE", 0.00015),
         sell_tax_rate=_float("SELL_TAX_RATE", 0.002),
         slippage_pct=_float("SLIPPAGE_PCT", 0.001),
+        extra_holidays=[d.strip() for d in _env("EXTRA_HOLIDAYS").split(",") if d.strip()],
     )
     return Settings(kis=kis, llm=llm, risk=risk, trading=trading)
